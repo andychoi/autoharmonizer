@@ -2,7 +2,7 @@ import os
 import warnings
 import pickle
 import numpy as np
-from config import *    
+from config import *
 from music21 import *
 from tqdm import trange
 from copy import deepcopy
@@ -11,168 +11,147 @@ from samplings import gamma_sampling
 from loader import get_filenames, convert_files
 from tensorflow.python.keras.utils.np_utils import to_categorical
 
-# use cpu
+# force CPU-only and suppress TF warnings
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 warnings.filterwarnings("ignore")
 
-# Load chord types
-with open(CHORD_TYPES_PATH, "rb") as filepath:
-    chord_types = pickle.load(filepath)
+# Load chord types once
+with open(CHORD_TYPES_PATH, "rb") as fp:
+    chord_types = pickle.load(fp)
 
-def generate_chord(chord_model, melody_data, beat_data, key_data, segment_length=SEGMENT_LENGTH, rhythm_gamma=RHYTHM_DENSITY, chord_per_bar=CHORD_PER_BAR):
+# Inference batch size
+INFER_BATCH_SIZE = 32
+
+def generate_chord(chord_model, melody_data, beat_data, key_data,
+                   segment_length=SEGMENT_LENGTH, rhythm_gamma=RHYTHM_DENSITY,
+                   chord_per_bar=CHORD_PER_BAR, batch_size=INFER_BATCH_SIZE):
 
     chord_data = []
 
-    # Process each melody sequence in the corpus
-    for idx, song_melody in enumerate(melody_data):
+    for song_idx, song_melody in enumerate(melody_data):
+        padded_melody = segment_length*[0] + song_melody + segment_length*[0]
+        padded_beat   = segment_length*[0] + beat_data[song_idx]   + segment_length*[0]
+        padded_key    = segment_length*[0] + key_data[song_idx]    + segment_length*[0]
+        song_chord    = segment_length * [0]
 
-        # Load the corresponding beat sequence
-        song_melody = segment_length*[0] + song_melody + segment_length*[0]
-        song_beat = segment_length*[0] + beat_data[idx] + segment_length*[0]
-        song_key = segment_length*[0] + key_data[idx] + segment_length*[0]
-        song_chord  = segment_length*[0]
-        
-        # Predict each pair
-        for idx in range(segment_length, len(song_melody)-segment_length):
-            
-            # Create input data
-            melody_left = song_melody[idx-segment_length:idx]
-            melody_right = song_melody[idx:idx+segment_length][::-1]
-            beat_left = song_beat[idx-segment_length:idx]
-            beat_right = song_beat[idx:idx+segment_length][::-1]
-            key_left = song_key[idx-segment_length:idx]
-            key_right = song_key[idx:idx+segment_length][::-1]
-            chord_left = song_chord[idx-segment_length:idx]
-            
-            # One-hot vectorization
-            melody_left = to_categorical(melody_left, num_classes=128)
-            melody_right = to_categorical(melody_right, num_classes=128)
-            beat_left = to_categorical(beat_left, num_classes=5)
-            beat_right = to_categorical(beat_right, num_classes=5)
-            key_left = to_categorical(key_left, num_classes=16)
-            key_right = to_categorical(key_right, num_classes=16)
-            condition_left = np.concatenate((beat_left, key_left), axis=-1)
-            condition_right = np.concatenate((beat_right, key_right), axis=-1)
-            chord_left = to_categorical(chord_left, num_classes=len(chord_types))
+        n_steps = len(padded_melody) - 2*segment_length
 
-            # expand dimension
-            melody_left = np.expand_dims(melody_left, axis=0)
-            melody_right = np.expand_dims(melody_right, axis=0)
-            condition_left = np.expand_dims(condition_left, axis=0)
-            condition_right = np.expand_dims(condition_right, axis=0)
-            chord_left = np.expand_dims(chord_left, axis=0)
-            
-            # Predict the next chord
-            prediction = chord_model.predict(x=[melody_left, melody_right, condition_left, condition_right, chord_left])[0]
+        buf_ml, buf_mr = [], []
+        buf_cl, buf_cr = [], []
+        buf_chl, buf_info = [], []
 
-            if song_melody[idx]!=0 and song_beat[idx]==4:
-                prediction = gamma_sampling(prediction, [[0]], [1], return_probs=True)
+        for t in trange(segment_length, len(padded_melody)-segment_length,
+                        desc=f"Song {song_idx+1} [{n_steps} steps]"):
 
-            # Tuning rhythm density
-            if chord_per_bar:
-                if song_beat[idx]==4 and (song_melody[idx]!=song_melody[idx-1] or song_beat[idx]!=song_beat[idx-1]) and not (idx==segment_length and song_melody[idx]==0):
-                    prediction = gamma_sampling(prediction, [[song_chord[-1]]], [1], return_probs=True)
-                
-                else:
-                    prediction = gamma_sampling(prediction, [[song_chord[-1]]], [0], return_probs=True)
+            left = slice(t-segment_length, t)
+            right = slice(t, t+segment_length)
 
-            else:
-                prediction = gamma_sampling(prediction, [[song_chord[-1]]], [rhythm_gamma], return_probs=True)
+            ml = to_categorical(padded_melody[left], num_classes=128)[None]
+            mr = to_categorical(padded_melody[right][::-1], num_classes=128)[None]
 
-            cho_idx = np.argmax(prediction, axis=-1)
-            song_chord.append(cho_idx)
-        
-        # Remove the leading padding 
+            bl = to_categorical(padded_beat[left], num_classes=5)
+            br = to_categorical(padded_beat[right][::-1], num_classes=5)
+            kl = to_categorical(padded_key[left], num_classes=16)
+            kr = to_categorical(padded_key[right][::-1], num_classes=16)
+            cl = np.concatenate((bl, kl), axis=-1)[None]
+            cr = np.concatenate((br, kr), axis=-1)[None]
+
+            chl = to_categorical(song_chord[-segment_length:], num_classes=len(chord_types))[None]
+
+            buf_ml.append(ml)
+            buf_mr.append(mr)
+            buf_cl.append(cl)
+            buf_cr.append(cr)
+            buf_chl.append(chl)
+            buf_info.append((song_chord[-1], padded_beat[t]))
+
+            if len(buf_ml) == batch_size or t == len(padded_melody)-segment_length-1:
+                X = [
+                    np.vstack(buf_ml),
+                    np.vstack(buf_mr),
+                    np.vstack(buf_cl),
+                    np.vstack(buf_cr),
+                    np.vstack(buf_chl)
+                ]
+                preds = chord_model.predict(X, verbose=0)
+                for p, (prev_chord, beat_val) in zip(preds, buf_info):
+                    if chord_per_bar:
+                        gamma = 1 if beat_val == 4 and prev_chord != song_chord[-1] else 0
+                    else:
+                        gamma = rhythm_gamma
+                    tuned = gamma_sampling(p, [[prev_chord]], [gamma], return_probs=True)
+                    cho = np.argmax(tuned, axis=-1)
+                    song_chord.append(cho)
+
+                buf_ml.clear(); buf_mr.clear()
+                buf_cl.clear(); buf_cr.clear()
+                buf_chl.clear(); buf_info.clear()
+
         chord_data.append(song_chord[segment_length:])
 
     return chord_data
 
-
 def watermark(score, filename, water_mark=WATER_MARK):
-
-    # Add water mark
     if water_mark:
-        
         score.metadata = metadata.Metadata()
         score.metadata.title = filename
         score.metadata.composer = 'harmonized by AutoHarmonizer'
-    
     return score
 
+def export_music(score, beat_data, chord_data, filename,
+                 repeat_chord=REPEAT_CHORD, outputs_path=OUTPUTS_PATH,
+                 water_mark=WATER_MARK):
 
-def export_music(score, beat_data, chord_data, filename, repeat_chord=REPEAT_CHORD, outputs_path=OUTPUTS_PATH, water_mark=WATER_MARK):
-
-    # Convert to music
     harmony_list = []
     offset = 0.0
-    filename = os.path.basename(filename)
-    filename = '.'.join(filename.split('.')[:-1])
+    base = os.path.basename(filename)
+    stem = '.'.join(base.split('.')[:-1])
 
-    for idx, song_chord in enumerate(chord_data):
-        song_chord = [chord_types[int(cho_idx)] for cho_idx in song_chord]
-        song_beat = beat_data[idx]
-        pre_chord = None
-        
-        for t_idx, cho in enumerate(song_chord):
-            cho = cho.replace('N.C.', 'R')
-            cho = cho.replace('bpedal', '-pedal')
-            if cho != 'R' and (pre_chord != cho or (repeat_chord and t_idx!=0 and song_beat[t_idx]==4 and song_beat[t_idx-1]!=4)):
-                chord_symbol= harmony.ChordSymbol(cho)
-                chord_symbol = chord_symbol
-                chord_symbol.offset = offset
-                harmony_list.append(chord_symbol)
+    for idx, song_ch in enumerate(chord_data):
+        labels = [chord_types[int(c)].replace('N.C.', 'R').replace('bpedal', '-pedal') for c in song_ch]
+        pre = None
+        for t, lbl in enumerate(labels):
+            if lbl != 'R' and (lbl != pre or (repeat_chord and beat_data[idx][t] == 4)):
+                cs = harmony.ChordSymbol(lbl)
+                cs.offset = offset
+                harmony_list.append(cs)
             offset += 0.25
-            pre_chord = cho
+            pre = lbl
 
-    h_idx=  0
-    new_score = []
-    offset_list = []
-
+    new_measures = []
+    offsets = []
+    h_idx = 0
     for m in score:
         if isinstance(m, stream.Measure):
             new_m = deepcopy(m)
-            m_list = []
-            offset_list.append(m.offset)
-            for n in new_m:
-                if not isinstance(n, harmony.ChordSymbol):
-                    if h_idx<len(harmony_list) and n.offset+m.offset>=harmony_list[h_idx].offset:
-                        harmony_list[h_idx].offset -= m.offset
-                        m_list.append(harmony_list[h_idx])
-                        h_idx += 1
-                    m_list.append(n)
+            offsets.append(m.offset)
+            elems = []
+            for el in new_m:
+                while h_idx < len(harmony_list) and el.offset + m.offset >= harmony_list[h_idx].offset:
+                    harmony_list[h_idx].offset -= m.offset
+                    elems.append(harmony_list[h_idx])
+                    h_idx += 1
+                elems.append(el)
+            new_m.elements = elems
+            new_measures.append(new_m)
 
-            new_m.elements = m_list
-            new_score.append(new_m)
+    final_score = stream.Score(new_measures)
+    for i, m in enumerate(final_score):
+        m.offset = offsets[i]
 
-    # Convert to score
-    score = stream.Score(new_score)
-    for m_idx, m in enumerate(score):
-        m.offset = offset_list[m_idx]
     if water_mark:
-        score = watermark(score, filename)
-    score.write('mxl', fp=outputs_path+'/'+filename+'.mxl')
+        final_score = watermark(final_score, stem)
 
+    final_score.write('mxl', fp=f"{outputs_path}/{stem}.mxl")
 
 if __name__ == "__main__":
+    files = get_filenames(input_dir=INPUTS_PATH)
+    data = convert_files(files, fromDataset=False)
 
-    # Load data from 'inputs'
-    filenames = get_filenames(input_dir=INPUTS_PATH)
-    data_corpus = convert_files(filenames, fromDataset=False)
+    model = build_model(SEGMENT_LENGTH, RNN_SIZE, NUM_LAYERS, DROPOUT,
+                        WEIGHTS_PATH, training=False)
 
-    # Build harmonic rhythm and chord model
-    model = build_model(SEGMENT_LENGTH, RNN_SIZE, NUM_LAYERS, DROPOUT, WEIGHTS_PATH, training=False)
-    
-    # Process each melody sequence
-    for idx in trange(len(data_corpus)):
-        
-        melody_data = data_corpus[idx][0]
-        beat_data = data_corpus[idx][1]
-        key_data = data_corpus[idx][2]
-        score = data_corpus[idx][3]
-        filename = data_corpus[idx][4]
-
-        # Generate harmonic rhythm and chord data
-        chord_data = generate_chord(model, melody_data, beat_data, key_data)
-        
-        # Export music file
-        export_music(score, beat_data, chord_data, filename)
+    for md, bd, kd, score_obj, fname in data:
+        chords = generate_chord(model, md, bd, kd)
+        export_music(score_obj, bd, chords, fname)

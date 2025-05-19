@@ -3,6 +3,7 @@ import math
 import pickle
 import numpy as np
 import keras_metrics as km
+from tensorflow_addons.metrics import F1Score
 from config import *
 from tqdm import trange
 from keras import Model
@@ -264,9 +265,11 @@ def build_model(segment_length, rnn_size, num_layers, dropout, weights_path=None
                   outputs= output_chord
                  )
 
+    f1 = F1Score(num_classes=len(chord_types), average='macro')
     model.compile(optimizer='adam',
                   loss='categorical_crossentropy',
-                  metrics=['accuracy', km.f1_score()])
+                #   metrics=['accuracy', km.f1_score()])
+                  metrics=['accuracy', f1])
     
     if weights_path==None:
         model.summary()
